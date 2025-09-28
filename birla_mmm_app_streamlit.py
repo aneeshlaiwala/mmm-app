@@ -1,4 +1,3 @@
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -49,16 +48,24 @@ def make_lag(df, group_keys, value_cols, lag=1):
     return out
 
 def run_ols(df, y_col, x_cols, add_const=True):
-    work = df[[y_col] + x_cols].dropna()
-    if work.empty:
+    # Robust version: safe NA handling and prediction assignment
+    work_cols = [y_col] + list(x_cols)
+    work = df[work_cols].copy().dropna()
+    if work.empty or len(x_cols) == 0:
         return None, None, None, None
     X = work[x_cols]
     if add_const:
         X = sm.add_constant(X, has_constant="add")
     y = work[y_col]
-    model = sm.OLS(y, X).fit()
-    work = work.copy()
-    work["Predicted"] = model.predict(X)
+    try:
+        model = sm.OLS(y, X).fit()
+    except Exception:
+        return None, None, None, None
+    try:
+        preds = model.predict(X)
+        work["Predicted"] = pd.Series(preds, index=work.index)
+    except Exception:
+        work["Predicted"] = None
     coef = pd.DataFrame({
         "Variable": model.params.index,
         "Coefficient": model.params.values,
@@ -88,7 +95,7 @@ def executive_summary(coef_df, fit_df, y_name="Sales"):
             bullets.append("Headwinds (negative): " + ", ".join(top_neg) + ".")
     else:
         bullets.append("No strongly significant drivers at p<=0.10. Consider fewer variables or more months.")
-    return "\\n".join([f"- {b}" for b in bullets])
+    return "\n".join([f"- {b}" for b in bullets])
 
 def download_excel(dfs: dict, name="MMM_Results.xlsx"):
     output = BytesIO()
@@ -166,8 +173,13 @@ with left:
 
 with right:
     st.write("Lag suggestions")
-    lag_suggest = [c for c in media_picks + trade_picks if any(k in c.lower() for k in ["tv","digital","youtube","video","ooh","print","in-bill","inbill","cn"])]
+    lag_suggest = [c for c in media_picks + trade_picks if (any(k in c.lower() for k in ["tv","digital","youtube","video","ooh","print","in-bill","inbill","cn"]) and not c.lower().endswith("_lag1"))]
     lag_vars = st.multiselect("Create Lag-1 for:", options=list(set(media_picks + trade_picks + external_picks)), default=lag_suggest)
+    # Prevent double-lagging
+    blocked = [v for v in lag_vars if v.lower().endswith("_lag1")]
+    if blocked:
+        st.warning("Skipped creating lag for already lagged columns: " + ", ".join(blocked))
+    lag_create_vars = [v for v in lag_vars if not v.lower().endswith("_lag1")]
     use_only_lag = st.checkbox("Use only lagged versions (replace with _Lag1)", value=True)
 
     st.write("One-click presets")
@@ -176,12 +188,12 @@ with right:
 # Build working frame with lags
 x_all = media_picks + trade_picks + external_picks
 df_work = df.copy()
-if lag_vars:
-    df_work = make_lag(df_work, group_keys, lag_vars, lag=1)
+if lag_create_vars:
+    df_work = make_lag(df_work, group_keys, lag_create_vars, lag=1)
     if use_only_lag:
-        x_all = [x for x in x_all if x not in lag_vars] + [x + "_Lag1" for x in lag_vars]
+        x_all = [x for x in x_all if x not in lag_create_vars] + [x + "_Lag1" for x in lag_create_vars]
     else:
-        x_all = x_all + [x + "_Lag1" for x in lag_vars]
+        x_all = x_all + [x + "_Lag1" for x in lag_create_vars]
 
 # -----------------------
 # Run bucket tests (if preset selected)
@@ -193,7 +205,7 @@ def bucket_run(title, x_cols):
         return None, None, None, None
     model, work, coef_df, fit_df = run_ols(df_work, y_col, x_cols, add_const=True)
     if model is None:
-        st.warning("Model could not run (missing data after NA drop).")
+        st.warning("Model could not run (insufficient usable rows after NA drop or singular design).")
         return None, None, None, None
     st.table(fit_df)
     st.dataframe(coef_df)
@@ -218,6 +230,7 @@ if preset.startswith("Bucket"):
                     keepers.append(v)
     add_keepers(m_coef, "pos")
     add_keepers(t_coef, "pos")
+    # External: SoV negative; PDO/OFR/PCO positive
     if e_coef is not None:
         for _, r in e_coef.iterrows():
             v=r["Variable"]; lc=v.lower()
@@ -262,6 +275,38 @@ with right2:
     st.pyplot(fig2)
 
 # -----------------------
+# Impact / Elasticity summary
+# -----------------------
+st.markdown("## Impact summary (elasticity)")
+try:
+    used_vars = [v for v in f_coef["Variable"] if v != "const"]
+    means_x = f_work[used_vars].mean(numeric_only=True)
+    mean_y = float(f_work[y_col].mean())
+    impact_rows = []
+    for _, r in f_coef.iterrows():
+        v = r["Variable"]
+        if v == "const": continue
+        coef_v = float(r["Coefficient"])
+        mx = float(means_x.get(v, np.nan))
+        if np.isnan(mx) or mean_y == 0:
+            elast = np.nan
+        else:
+            elast = coef_v * (mx / mean_y)
+        if pd.isna(elast):
+            impact = "Low"
+        elif elast > 0.5:
+            impact = "High"
+        elif elast >= 0.2:
+            impact = "Medium"
+        else:
+            impact = "Low"
+        impact_rows.append({"Variable": v, "Coefficient": round(coef_v, 4), "Elasticity": round(elast, 3) if not pd.isna(elast) else None, "Impact": impact})
+    impact_df = pd.DataFrame(impact_rows)
+    st.dataframe(impact_df.sort_values(["Impact","Elasticity"], ascending=[False, False]), use_container_width=True)
+except Exception:
+    st.info("Elasticity table not available for this run.")
+
+# -----------------------
 # ROI simulator
 # -----------------------
 st.markdown("## ROI Simulator")
@@ -292,7 +337,6 @@ dfs = {"Final_Coefficients": f_coef, "Final_Fit": f_fit, "Predictions": preds}
 download_excel(dfs, name="BirlaOpus_Guided_MMM_Results.xlsx")
 
 html = f"""
-
 <h2>Birla Opus - MMM Guided Summary</h2>
 <p><b>Dependent:</b> {y_col}</p>
 <h3>Executive Summary</h3>
@@ -304,7 +348,6 @@ html = f"""
 </table>
 <h3>ROI Simulation</h3>
 <p>Driver: {roi_var} | Delta%: {pct_change}% | Incremental Volume: {incr_kl:.2f} KL{(' | Incremental Revenue: ₹ ' + format(incr_rev, ',.0f')) if asp>0 else ''}</p>
-
 """
 st.download_button("Download HTML Summary", data=html.encode("utf-8"), file_name="BirlaOpus_Guided_MMM_Summary.html", mime="text/html")
 
